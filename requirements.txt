@@ -1,0 +1,5 @@
+vnstock
+pandas
+pandas_ta
+streamlit
+plotly
