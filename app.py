@@ -1,18 +1,29 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-# pyrefly: ignore [missing-import]
 import plotly.graph_objects as go
-# pyrefly: ignore [missing-import]
 from plotly.subplots import make_subplots
 from datetime import datetime
 
-from data_loader import PRESET_GROUPS, get_stock_data, get_multiple_stocks_data
+from data_loader import (
+    PRESET_GROUPS, 
+    get_stock_data, 
+    get_multiple_stocks_data,
+    get_stock_intraday_price_depth,
+    sync_multiple_price_depth
+)
 from indicators import calculate_indicators, evaluate_signal
+from database import (
+    test_connection,
+    init_mysql_db,
+    get_price_depth_from_mysql,
+    get_saved_sessions_from_mysql,
+    delete_session_from_mysql
+)
 
 # Page Config
 st.set_page_config(
-    page_title="VNIndex Stock Technical Analyzer",
+    page_title="VNIndex Technical & Price Depth Analyzer",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -70,12 +81,12 @@ if 'scan_df' not in st.session_state:
     st.session_state['scan_df'] = pd.DataFrame()
 if 'stock_data_map' not in st.session_state:
     st.session_state['stock_data_map'] = {}
-if 'last_scanned_tickers' not in st.session_state:
-    st.session_state['last_scanned_tickers'] = []
+if 'price_depth_cache' not in st.session_state:
+    st.session_state['price_depth_cache'] = {}
 
 # Title & Header
-st.title("📈 VNIndex Stock Technical Analyzer")
-st.caption(f"Hệ thống phân tích kỹ thuật cổ phiếu Việt Nam tự động • Cập nhật lúc {datetime.now().strftime('%H:%M:%S - %d/%m/%Y')}")
+st.title("📈 VNIndex Technical & Price Depth Analyzer")
+st.caption(f"Hệ thống phân tích kỹ thuật & Phân bổ khối lượng theo mức giá (MySQL Persistence) • Cập nhật: {datetime.now().strftime('%H:%M:%S - %d/%m/%Y')}")
 
 # Sidebar Options
 st.sidebar.header("⚙️ Cấu Hình Động")
@@ -101,6 +112,33 @@ show_ma200 = st.sidebar.checkbox("Hiển thị MA200", value=True)
 show_bb = st.sidebar.checkbox("Dải Bollinger Bands", value=True)
 show_rsi = st.sidebar.checkbox("Chỉ báo RSI", value=True)
 show_macd = st.sidebar.checkbox("Chỉ báo MACD", value=True)
+
+# Sidebar MySQL Connection Configuration
+st.sidebar.markdown("---")
+with st.sidebar.expander("🗄️ Cấu Hình MySQL Database", expanded=False):
+    mysql_host = st.text_input("Host", value="localhost", key="m_host")
+    mysql_port = st.number_input("Port", value=3306, step=1, key="m_port")
+    mysql_user = st.text_input("User", value="root", key="m_user")
+    mysql_password = st.text_input("Password", value="", type="password", key="m_pass")
+    mysql_db = st.text_input("Database Name", value="vnstock_db", key="m_db")
+    
+    mysql_config = {
+        "host": mysql_host,
+        "port": mysql_port,
+        "user": mysql_user,
+        "password": mysql_password,
+        "database": mysql_db
+    }
+    
+    if st.button("🔌 Kiểm Tra & Khởi Tạo DB", use_container_width=True):
+        ok, msg = test_connection(mysql_config)
+        if ok:
+            st.success(f"✅ {msg}")
+            init_ok, init_msg = init_mysql_db(mysql_config)
+            if init_ok:
+                st.info(f"ℹ️ {init_msg}")
+        else:
+            st.error(f"❌ {msg}")
 
 st.sidebar.markdown("---")
 analyze_btn = st.sidebar.button("🚀 Phân Tích Kỹ Thuật", use_container_width=True, type="primary")
@@ -141,9 +179,6 @@ if analyze_btn or st.session_state['scan_df'].empty:
             if summary_list:
                 st.session_state['scan_df'] = pd.DataFrame(summary_list)
                 st.session_state['stock_data_map'] = processed_map
-                st.session_state['last_scanned_tickers'] = selected_tickers
-            else:
-                st.error("❌ Không lấy được dữ liệu cho các mã đã chọn.")
 
 # Display Dashboard Layout
 scan_df = st.session_state.get('scan_df', pd.DataFrame())
@@ -157,7 +192,6 @@ if not scan_df.empty:
     bullish_cnt = len(scan_df[scan_df['Tín Hiệu'].str.contains("Tăng", na=False)])
     bearish_cnt = len(scan_df[scan_df['Tín Hiệu'].str.contains("Giảm", na=False)])
     neutral_cnt = total_scanned - bullish_cnt - bearish_cnt
-    
     top_gainer = scan_df.sort_values(by="Thay Đổi (1D %)", ascending=False).iloc[0]
     
     col1.metric("Tổng Số Mã", f"{total_scanned} Mã")
@@ -169,13 +203,182 @@ if not scan_df.empty:
     st.markdown("---")
 
     # Main Tabs
-    tab1, tab2, tab3 = st.tabs(["📊 Bảng Tín Hiệu Screener", "📈 Biểu Đồ Kỹ Thuật Chi Tiết", "⚖️ So Sánh Hiệu Suất"])
+    tab_vp, tab_screener, tab_chart, tab_compare, tab_db = st.tabs([
+        "📊 Phân Bổ Mức Giá (Volume Profile)", 
+        "📋 Bảng Tín Hiệu Screener", 
+        "📈 Biểu Đồ Kỹ Thuật Chi Tiết", 
+        "⚖️ So Sánh Hiệu Suất",
+        "🗄️ Quản Lý Database MySQL"
+    ])
 
-    # TAB 1: SCREENER TABLE
-    with tab1:
+    # =========================================================================
+    # TAB 1: VOLUME PROFILE / PRICE DEPTH BREAKDOWN
+    # =========================================================================
+    with tab_vp:
+        st.subheader("📊 Chi Tiết Khối Lượng Giao Dịch Tại Từng Mức Giá (Price Depth)")
+        st.info("💡 Tính năng phân tích khối lượng giao dịch khớp lệnh từng giây (intraday tick) theo mức giá cụ thể của từng phiên, phân tách Mua/Bán chủ động và lưu trữ tự động vào MySQL Database.")
+        
+        c_sym, c_mode, c_btn = st.columns([2, 2, 2])
+        with c_sym:
+            all_options = selected_tickers if selected_tickers else PRESET_GROUPS["VN30"]
+            vp_symbol = st.selectbox("Chọn mã chứng khoán phân tích:", all_options, index=0, key="vp_sym")
+        with c_mode:
+            data_source_mode = st.radio("Nguồn Dữ Liệu:", ["Tải mới từ Vnstock & Lưu MySQL", "Đọc từ Database MySQL"], horizontal=True, key="vp_mode")
+        with c_btn:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            fetch_vp_btn = st.button("🔄 Lấy Dữ Liệu Phân Bổ Mức Giá", type="primary", use_container_width=True)
+
+        if fetch_vp_btn or vp_symbol not in st.session_state['price_depth_cache']:
+            with st.spinner(f"Đang xử lý dữ liệu khối lượng theo mức giá cho {vp_symbol}..."):
+                if "Tải mới" in data_source_mode:
+                    agg_df, raw_trades = get_stock_intraday_price_depth(vp_symbol, mysql_config=mysql_config, save_to_db=True)
+                else:
+                    agg_df = get_price_depth_from_mysql(vp_symbol, config=mysql_config)
+                
+                if not agg_df.empty:
+                    st.session_state['price_depth_cache'][vp_symbol] = agg_df
+                else:
+                    st.session_state['price_depth_cache'][vp_symbol] = pd.DataFrame()
+
+        df_vp = st.session_state['price_depth_cache'].get(vp_symbol, pd.DataFrame())
+
+        if not df_vp.empty:
+            # Calculate Summary Metrics
+            total_session_vol = df_vp['total_volume'].sum() if 'total_volume' in df_vp else df_vp['total_vol'].sum()
+            total_buy_vol = df_vp['buy_volume'].sum() if 'buy_volume' in df_vp else df_vp['buy_vol'].sum()
+            total_sell_vol = df_vp['sell_volume'].sum() if 'sell_volume' in df_vp else df_vp['sell_vol'].sum()
+            total_other_vol = df_vp['other_volume'].sum() if 'other_volume' in df_vp else df_vp.get('other_vol', pd.Series([0])).sum()
+            
+            # Point of Control (POC): Price with maximum total volume
+            poc_row = df_vp.sort_values(by=['total_volume' if 'total_volume' in df_vp else 'total_vol'], ascending=False).iloc[0]
+            poc_price = poc_row['price']
+            poc_vol = poc_row['total_volume'] if 'total_volume' in df_vp else poc_row['total_vol']
+            
+            buy_pct = (total_buy_vol / total_session_vol * 100) if total_session_vol > 0 else 0
+            sell_pct = (total_sell_vol / total_session_vol * 100) if total_session_vol > 0 else 0
+
+            # Metric Cards
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Giá Khớp Nhiều Nhất (POC)", f"{poc_price:,.1f} VNĐ", f"KL: {poc_vol:,.0f}")
+            m2.metric("Tổng KL Khớp Phiên", f"{total_session_vol:,.0f}")
+            m3.metric("KL Mua Chủ Động 🟢", f"{total_buy_vol:,.0f}", f"{buy_pct:.1f}% Phiên")
+            m4.metric("KL Bán Chủ Động 🔴", f"{total_sell_vol:,.0f}", f"{sell_pct:.1f}% Phiên")
+
+            st.markdown("---")
+
+            # Chart & Donut Layout
+            col_chart, col_donut = st.columns([3, 1])
+
+            with col_chart:
+                st.subheader(f"Biểu Đồ Volume Profile Theo Mức Giá - {vp_symbol}")
+                
+                fig_vp = go.Figure()
+                
+                # Buy Volume Bar
+                fig_vp.add_trace(go.Bar(
+                    y=df_vp['price'],
+                    x=df_vp['buy_volume'] if 'buy_volume' in df_vp else df_vp['buy_vol'],
+                    name='Mua Chủ Động',
+                    orientation='h',
+                    marker=dict(color='#00c853')
+                ))
+                
+                # Sell Volume Bar
+                fig_vp.add_trace(go.Bar(
+                    y=df_vp['price'],
+                    x=df_vp['sell_volume'] if 'sell_volume' in df_vp else df_vp['sell_vol'],
+                    name='Bán Chủ Động',
+                    orientation='h',
+                    marker=dict(color='#d50000')
+                ))
+
+                # Other Volume Bar
+                if 'other_volume' in df_vp or 'other_vol' in df_vp:
+                    fig_vp.add_trace(go.Bar(
+                        y=df_vp['price'],
+                        x=df_vp['other_volume'] if 'other_volume' in df_vp else df_vp['other_vol'],
+                        name='Khác (ATO/ATC)',
+                        orientation='h',
+                        marker=dict(color='#757575')
+                    ))
+
+                fig_vp.update_layout(
+                    barmode='stack',
+                    template='plotly_dark',
+                    height=500,
+                    xaxis_title="Khối Lượng Giao Dịch",
+                    yaxis_title="Mức Giá (1,000 VNĐ)",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    margin=dict(l=40, r=40, t=40, b=40)
+                )
+
+                st.plotly_chart(fig_vp, use_container_width=True)
+
+            with col_donut:
+                st.subheader("Tỷ Lệ Đặt Lệnh")
+                fig_donut = go.Figure(data=[go.Pie(
+                    labels=['Mua Chủ Động', 'Bán Chủ Động', 'Khác (ATO/ATC)'],
+                    values=[total_buy_vol, total_sell_vol, total_other_vol],
+                    hole=.5,
+                    marker_colors=['#00c853', '#d50000', '#757575']
+                )])
+                fig_donut.update_layout(
+                    template='plotly_dark',
+                    height=450,
+                    showlegend=True,
+                    legend=dict(orientation="h", y=-0.1)
+                )
+                st.plotly_chart(fig_donut, use_container_width=True)
+
+            # Detailed Table
+            st.subheader(f"Bảng Chi Tiết Khối Lượng Giao Dịch Tại Từng Mức Giá - {vp_symbol}")
+            
+            show_df = df_vp.copy()
+            # Standardize column headers for display
+            display_cols = {
+                'price': 'Mức Giá (1k VNĐ)',
+                'buy_vol': 'KL Mua Chủ Động',
+                'buy_volume': 'KL Mua Chủ Động',
+                'sell_vol': 'KL Bán Chủ Động',
+                'sell_volume': 'KL Bán Chủ Động',
+                'other_vol': 'KL Khác (ATO/ATC)',
+                'other_volume': 'KL Khác (ATO/ATC)',
+                'total_volume': 'Tổng Khối Lượng',
+                'total_vol': 'Tổng Khối Lượng',
+                'ratio_pct': 'Tỷ Lệ (%)',
+                'trade_count': 'Số Lượt Khớp'
+            }
+            show_df = show_df.rename(columns=display_cols)
+            
+            if 'Tỷ Lệ (%)' not in show_df.columns and 'Tổng Khối Lượng' in show_df.columns:
+                show_df['Tỷ Lệ (%)'] = (show_df['Tổng Khối Lượng'] / total_session_vol * 100).round(2)
+
+            cols_order = ['Mức Giá (1k VNĐ)', 'KL Mua Chủ Động', 'KL Bán Chủ Động', 'KL Khác (ATO/ATC)', 'Tổng Khối Lượng', 'Tỷ Lệ (%)', 'Số Lượt Khớp']
+            cols_order = [c for c in cols_order if c in show_df.columns]
+            
+            st.dataframe(
+                show_df[cols_order].style.format({
+                    'Mức Giá (1k VNĐ)': '{:,.2f}',
+                    'KL Mua Chủ Động': '{:,.0f}',
+                    'KL Bán Chủ Động': '{:,.0f}',
+                    'KL Khác (ATO/ATC)': '{:,.0f}',
+                    'Tổng Khối Lượng': '{:,.0f}',
+                    'Tỷ Lệ (%)': '{:.2f}%',
+                    'Số Lượt Khớp': '{:,.0f}'
+                }),
+                use_container_width=True,
+                height=400
+            )
+
+        else:
+            st.warning(f"⚠️ Chưa có dữ liệu phân bổ mức giá cho mã {vp_symbol}. Vui lòng nhấn nút '🔄 Lấy Dữ Liệu Phân Bổ Mức Giá' để tải từ Vnstock API & lưu vào MySQL.")
+
+    # =========================================================================
+    # TAB 2: SCREENER TABLE
+    # =========================================================================
+    with tab_screener:
         st.subheader("Bảng Tổng Hợp Tín Hiệu Kỹ Thuật")
         
-        # Filter options
         signal_filter = st.radio(
             "Lọc Theo Tín Hiệu:", 
             ["Tất cả", "Tăng mạnh / Tăng giá", "Giảm mạnh / Giảm giá", "Trung tính"],
@@ -190,7 +393,6 @@ if not scan_df.empty:
         elif signal_filter == "Trung tính":
             filtered_df = filtered_df[filtered_df['Tín Hiệu'] == "Trung tính"]
 
-        # Styled Table Display
         st.dataframe(
             filtered_df.style.format({
                 "Giá Hiện Tại": "{:,.0f}",
@@ -209,8 +411,10 @@ if not scan_df.empty:
             height=450
         )
 
-    # TAB 2: DETAILED CHART (Plotly Candlestick + Indicators)
-    with tab2:
+    # =========================================================================
+    # TAB 3: DETAILED CHART (Plotly Candlestick + Indicators)
+    # =========================================================================
+    with tab_chart:
         st.subheader("Biểu Đồ Kỹ Thuật Tương Tác (TradingView Style)")
         
         available_symbols = list(data_map.keys())
@@ -222,7 +426,6 @@ if not scan_df.empty:
             if not df_chart.empty:
                 latest = df_chart.iloc[-1]
                 
-                # Header Metrics for Selected Stock
                 c1, c2, c3, c4, c5 = st.columns(5)
                 c1.metric("Giá Khớp Lệnh", f"{latest['close']:,.0f} VNĐ", f"{latest.get('change_1d', 0):+.2f}%")
                 c2.metric("Khối Lượng 1D", f"{int(latest['volume']):,}")
@@ -230,7 +433,6 @@ if not scan_df.empty:
                 c4.metric("MA50 / MA200", f"{latest.get('MA50', 0):,.0f} / {latest.get('MA200', 0):,.0f}")
                 c5.metric("Tín Hiệu MACD", "MUA" if latest.get('MACD', 0) > latest.get('MACD_Signal', 0) else "BÁN")
                 
-                # Determine rows count based on checkboxes
                 row_heights = [0.6]
                 subplot_titles = [f"{selected_symbol} - Giá & Khối Lượng"]
                 specs = [[{"secondary_y": True}]]
@@ -248,7 +450,6 @@ if not scan_df.empty:
                     subplot_titles.append("MACD (12, 26, 9)")
                     specs.append([{"secondary_y": False}])
 
-                # Normalize row heights sum to 1.0
                 total_h = sum(row_heights)
                 row_heights = [h / total_h for h in row_heights]
                 
@@ -261,7 +462,6 @@ if not scan_df.empty:
                     specs=specs
                 )
                 
-                # 1. Candlestick Chart
                 fig.add_trace(
                     go.Candlestick(
                         x=df_chart['time'],
@@ -276,7 +476,6 @@ if not scan_df.empty:
                     row=1, col=1
                 )
                 
-                # Moving Averages & Bollinger Bands Overlays
                 if show_ma20 and 'MA20' in df_chart:
                     fig.add_trace(go.Scatter(x=df_chart['time'], y=df_chart['MA20'], mode='lines', name='MA20', line=dict(color='#ff9800', width=1.5)), row=1, col=1)
                 if show_ma50 and 'MA50' in df_chart:
@@ -288,14 +487,12 @@ if not scan_df.empty:
                     fig.add_trace(go.Scatter(x=df_chart['time'], y=df_chart['BB_Upper'], mode='lines', name='BB Upper', line=dict(color='rgba(156, 39, 176, 0.4)', width=1, dash='dot')), row=1, col=1)
                     fig.add_trace(go.Scatter(x=df_chart['time'], y=df_chart['BB_Lower'], mode='lines', name='BB Lower', line=dict(color='rgba(156, 39, 176, 0.4)', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(156, 39, 176, 0.05)'), row=1, col=1)
 
-                # Volume Bar Chart (Secondary Y-axis)
                 colors = ['#00c853' if c >= o else '#d50000' for c, o in zip(df_chart['close'], df_chart['open'])]
                 fig.add_trace(
                     go.Bar(x=df_chart['time'], y=df_chart['volume'], name="Khối lượng", marker_color=colors, opacity=0.3),
                     row=1, col=1, secondary_y=True
                 )
 
-                # 2. RSI Subplot
                 curr_row = 2
                 if show_rsi and 'RSI' in df_chart:
                     fig.add_trace(go.Scatter(x=df_chart['time'], y=df_chart['RSI'], mode='lines', name='RSI', line=dict(color='#9c27b0', width=1.5)), row=curr_row, col=1)
@@ -304,14 +501,12 @@ if not scan_df.empty:
                     fig.update_yaxes(range=[0, 100], row=curr_row, col=1)
                     curr_row += 1
 
-                # 3. MACD Subplot
                 if show_macd and 'MACD' in df_chart:
                     fig.add_trace(go.Scatter(x=df_chart['time'], y=df_chart['MACD'], mode='lines', name='MACD', line=dict(color='#2196f3', width=1.5)), row=curr_row, col=1)
                     fig.add_trace(go.Scatter(x=df_chart['time'], y=df_chart['MACD_Signal'], mode='lines', name='Signal', line=dict(color='#ff9800', width=1.5)), row=curr_row, col=1)
                     hist_colors = ['#00c853' if h >= 0 else '#d50000' for h in df_chart['MACD_Hist']]
                     fig.add_trace(go.Bar(x=df_chart['time'], y=df_chart['MACD_Hist'], name='Histogram', marker_color=hist_colors, opacity=0.6), row=curr_row, col=1)
 
-                # Layout styling
                 fig.update_layout(
                     height=750,
                     template="plotly_dark",
@@ -325,8 +520,10 @@ if not scan_df.empty:
 
                 st.plotly_chart(fig, use_container_width=True)
 
-    # TAB 3: STOCK COMPARISON (% Return Normalization)
-    with tab3:
+    # =========================================================================
+    # TAB 4: STOCK COMPARISON
+    # =========================================================================
+    with tab_compare:
         st.subheader("So Sánh Tăng Trưởng Tương Đối (% Return)")
         
         selected_compare = st.multiselect("Chọn các mã cổ phiếu để so sánh:", available_symbols, default=available_symbols[:5] if len(available_symbols) >= 5 else available_symbols)
@@ -338,7 +535,6 @@ if not scan_df.empty:
                 if sym in data_map:
                     df_sym = data_map[sym].copy()
                     if not df_sym.empty:
-                        # Normalize to base 100 (%)
                         base_price = df_sym['close'].iloc[0]
                         df_sym['return_pct'] = ((df_sym['close'] / base_price) - 1) * 100
                         
@@ -362,3 +558,46 @@ if not scan_df.empty:
             )
             
             st.plotly_chart(fig_comp, use_container_width=True)
+
+    # =========================================================================
+    # TAB 5: MYSQL DATABASE MANAGER
+    # =========================================================================
+    with tab_db:
+        st.subheader("🗄️ Quản Lý Dữ Liệu Lưu Trữ Trong Cơ Sở Dữ Liệu MySQL")
+        
+        c_sync1, c_sync2 = st.columns([3, 1])
+        with c_sync1:
+            st.info("Tất cả dữ liệu khớp lệnh và tổng hợp phân bổ mức giá sẽ được lưu giữ lâu dài trong các bảng `price_depth_summary` và `intraday_trades` của MySQL.")
+        with c_sync2:
+            sync_btn = st.button("⚡ Đồng Bộ Hàng Loạt Vào MySQL", type="primary", use_container_width=True)
+            
+        if sync_btn:
+            with st.spinner(f"Đang đồng bộ dữ liệu mức giá cho {len(selected_tickers)} mã cổ phiếu vào MySQL..."):
+                sync_res = sync_multiple_price_depth(selected_tickers, mysql_config=mysql_config)
+                st.success(f"✅ Đã đồng bộ thành công {len(sync_res)} mã cổ phiếu vào MySQL Database!")
+
+        st.markdown("---")
+        st.write("### Danh Sách Các Phiên Đã Lưu Trong MySQL")
+        
+        saved_db_df = get_saved_sessions_from_mysql(mysql_config)
+        
+        if not saved_db_df.empty:
+            st.dataframe(
+                saved_db_df.style.format({
+                    'Tổng Khối Lượng': '{:,.0f}',
+                    'KL Mua Chủ Động': '{:,.0f}',
+                    'KL Bán Chủ Động': '{:,.0f}'
+                }),
+                use_container_width=True,
+                height=350
+            )
+            
+            csv_data = saved_db_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                label="📥 Xuất Báo Cáo MySQL Dạng CSV",
+                data=csv_data,
+                file_name=f"vnstock_mysql_price_depth_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
+        else:
+            st.warning("⚠️ Chưa tìm thấy bản ghi nào trong MySQL Database. Hãy kiểm tra thông tin kết nối MySQL hoặc nhấn '⚡ Đồng Bộ Hàng Loạt Vào MySQL'.")
